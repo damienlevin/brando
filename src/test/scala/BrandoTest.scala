@@ -297,10 +297,11 @@ class BrandoTest extends TestKit(ActorSystem("BrandoTest")) with FunSpecLike
     }
 
   }
+
   describe("blocking requests") {
     describe("subscribe") {
 
-      it("should be able to subscribe to a pubsub channel") {
+      /* it("should be able to subscribe to a pubsub channel") {
         val channel = UUID.randomUUID().toString
         val subscriber = system.actorOf(Brando())
 
@@ -311,7 +312,7 @@ class BrandoTest extends TestKit(ActorSystem("BrandoTest")) with FunSpecLike
           Some(ByteString(channel)),
           Some(1))))
       }
-
+       */
       it("should receive published messages from a pubsub channel") {
         val channel = UUID.randomUUID().toString
         val subscriber = system.actorOf(Brando())

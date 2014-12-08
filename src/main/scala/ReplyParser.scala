@@ -3,6 +3,7 @@ package brando
 import annotation.tailrec
 import akka.actor.Status
 import akka.util.ByteString
+import scala.collection.mutable.ListBuffer
 
 sealed abstract class StatusReply(val status: String) {
   val bytes = ByteString(status)
@@ -40,47 +41,47 @@ private[brando] object StatusReply {
 
 private[brando] trait ReplyParser {
 
-  var remainingBuffer = ByteString.empty
+  var remainingBuffer = ListBuffer[Byte]()
 
   trait Result {
     val reply: Option[Any]
-    val next: ByteString
+    val next: ListBuffer[Byte]
   }
-  case class Success(reply: Option[Any], next: ByteString = ByteString.empty)
+  case class Success(reply: Option[Any], next: ListBuffer[Byte] = ListBuffer[Byte]())
     extends Result
-  case class Failure(next: ByteString)
+  case class Failure(next: ListBuffer[Byte])
       extends Result {
     val reply = None
   }
 
-  def splitLine(buffer: ByteString): Option[(String, ByteString)] = {
+  def splitLine(buffer: ListBuffer[Byte]): Option[(String, ListBuffer[Byte])] = {
     val start = buffer.takeWhile(_ != '\r')
     val rest = buffer.drop(start.size)
-    if (rest.take(2) == ByteString("\r\n")) {
-      Some((start.drop(1).utf8String, rest.drop(2)))
+    if (rest.take(2) == ListBuffer[Byte]('\r', '\n')) {
+      Some((new String(start.drop(1).toArray), rest.drop(2)))
     } else {
       None
     }
   }
 
-  def readErrorReply(buffer: ByteString) = splitLine(buffer) match {
+  def readErrorReply(buffer: ListBuffer[Byte]) = splitLine(buffer) match {
     case Some((error, rest)) ⇒
       Success(Some(Status.Failure(new BrandoException(error))), rest)
     case _ ⇒ Failure(buffer)
   }
 
-  def readStatusReply(buffer: ByteString) = splitLine(buffer) match {
+  def readStatusReply(buffer: ListBuffer[Byte]) = splitLine(buffer) match {
     case Some((status, rest)) ⇒
       Success(StatusReply.fromString(status), rest)
     case _ ⇒ Failure(buffer)
   }
 
-  def readIntegerReply(buffer: ByteString) = splitLine(buffer) match {
+  def readIntegerReply(buffer: ListBuffer[Byte]) = splitLine(buffer) match {
     case Some((int, rest)) ⇒ Success(Some(int.toLong), rest)
     case x                 ⇒ Failure(buffer)
   }
 
-  def readBulkReply(buffer: ByteString): Result = splitLine(buffer) match {
+  def readBulkReply(buffer: ListBuffer[Byte]): Result = splitLine(buffer) match {
     case Some((length, rest)) ⇒
       val dataLength = length.toInt
 
@@ -94,7 +95,7 @@ private[brando] trait ReplyParser {
     case _ ⇒ Failure(buffer)
   }
 
-  def readMultiBulkReply(buffer: ByteString): Result = splitLine(buffer) match {
+  def readMultiBulkReply(buffer: ListBuffer[Byte]): Result = splitLine(buffer) match {
 
     case Some((count, rest)) ⇒
       val itemCount = count.toInt
@@ -120,12 +121,20 @@ private[brando] trait ReplyParser {
     case _ ⇒ Failure(buffer)
   }
 
-  def readPubSubMessage(buffer: ByteString) = splitLine(buffer) match {
+  def readPubSubMessage(buffer: ListBuffer[Byte]) = splitLine(buffer) match {
     case Some((int, rest)) ⇒ Success(Some(int.toLong), rest)
     case x                 ⇒ Failure(buffer)
   }
 
-  def parse(reply: ByteString) = reply(0) match {
+  def parse(bytes: ByteString): Result = {
+    parse(ListBuffer[Byte](bytes: _*))
+  }
+
+  final def parseReply(bytes: ByteString)(withReply: Any ⇒ Unit) {
+    parseReply(ListBuffer[Byte](bytes: _*))(withReply)
+  }
+
+  def parse(reply: ListBuffer[Byte]) = reply(0) match {
     case '+' ⇒ readStatusReply(reply)
     case ':' ⇒ readIntegerReply(reply)
     case '$' ⇒ readBulkReply(reply)
@@ -133,14 +142,14 @@ private[brando] trait ReplyParser {
     case '-' ⇒ readErrorReply(reply)
   }
 
-  @tailrec final def parseReply(bytes: ByteString)(withReply: Any ⇒ Unit) {
+  @tailrec final def parseReply(bytes: ListBuffer[Byte])(withReply: Any ⇒ Unit) {
     if (bytes.size > 0) {
       parse(remainingBuffer ++ bytes) match {
         case Failure(leftoverBytes) ⇒
           remainingBuffer = leftoverBytes
 
         case Success(reply, leftoverBytes) ⇒
-          remainingBuffer = ByteString.empty
+          remainingBuffer = ListBuffer[Byte]()
           withReply(reply)
 
           if (leftoverBytes.size > 0) {

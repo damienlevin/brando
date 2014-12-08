@@ -12,6 +12,7 @@ import scala.util.Try
 import com.typesafe.config.ConfigFactory
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
+import scala.collection.mutable.ListBuffer
 
 class BrandoException(message: String) extends Exception(message) {
   override lazy val toString = "%s: %s\n".format(getClass.getName, message)
@@ -62,10 +63,10 @@ private class Connection(
     case Tcp.Received(data) ⇒
       parseReply(data) { reply ⇒
         reply match {
-          case Some(List(Some(x: ByteString), Some(channel: ByteString), Some(message: ByteString))) if (x.utf8String == "message") ⇒
+          case Some(List(Some(x: ListBuffer[Byte]), Some(channel: ListBuffer[Byte]), Some(message: ListBuffer[Byte]))) if (new String(x.toArray) == "message") ⇒
 
-            val pubSubMessage = PubSubMessage(channel.utf8String, message.utf8String)
-            getSubscribers(channel).map { x ⇒
+            val pubSubMessage = PubSubMessage(new String(channel.toArray), new String(message.toArray))
+            getSubscribers(ByteString(channel.toArray)).map { x ⇒
               x ! pubSubMessage
             }
 

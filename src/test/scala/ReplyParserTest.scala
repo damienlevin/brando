@@ -2,6 +2,7 @@ package brando
 
 import akka.util.ByteString
 import org.scalatest.{ FunSpec, BeforeAndAfterEach }
+import scala.collection.mutable.ListBuffer
 
 class ReplyParserTest extends FunSpec with BeforeAndAfterEach {
 
@@ -9,7 +10,7 @@ class ReplyParserTest extends FunSpec with BeforeAndAfterEach {
   import Parser._
 
   override def afterEach() {
-    remainingBuffer = ByteString.empty
+    remainingBuffer = ListBuffer[Byte]()
   }
 
   describe("Status reply") {
