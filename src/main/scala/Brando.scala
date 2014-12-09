@@ -63,7 +63,7 @@ private class Connection(
     case Tcp.Received(data) ⇒
       parseReply(data) { reply ⇒
         reply match {
-          case Some(List(Some(x: ListBuffer[Byte]), Some(channel: ListBuffer[Byte]), Some(message: ListBuffer[Byte]))) if (new String(x.toArray) == "message") ⇒
+          case Some(ListBuffer(Some(x: ListBuffer[Byte]), Some(channel: ListBuffer[Byte]), Some(message: ListBuffer[Byte]))) if (new String(x.toArray) == "message") ⇒
 
             val pubSubMessage = PubSubMessage(new String(channel.toArray), new String(message.toArray))
             getSubscribers(ByteString(channel.toArray)).map { x ⇒
