@@ -45,85 +45,81 @@ private[brando] trait ReplyParser {
 
   trait Result {
     val reply: Option[Any]
-    val next: ListBuffer[Byte]
+    val leftBytes: Int
   }
-  case class Success(reply: Option[Any], next: ListBuffer[Byte] = ListBuffer[Byte]())
-    extends Result
-  case class Failure(next: ListBuffer[Byte])
-      extends Result {
+  case class Success(reply: Option[Any], leftBytes: Int = 0) extends Result
+  case class Failure(leftBytes: Int = 0) extends Result {
     val reply = None
   }
 
-  def splitLine(buffer: ListBuffer[Byte]): Option[(String, ListBuffer[Byte])] = {
+  def splitLine(buffer: ListBuffer[Byte]): Option[(String, Int)] = {
     val start = buffer.takeWhile(_ != '\r')
-    val rest = buffer.drop(start.size)
-    if (rest.take(2) == ListBuffer[Byte]('\r', '\n')) {
-      Some((new String(start.drop(1).toArray), rest.drop(2)))
+    if (buffer.slice(start.size, start.size + 2) == ListBuffer[Byte]('\r', '\n')) {
+      Some((new String(start.drop(1).toArray), buffer.size - (start.size + 2)))
     } else {
       None
     }
   }
 
   def readErrorReply(buffer: ListBuffer[Byte]) = splitLine(buffer) match {
-    case Some((error, rest)) ⇒
-      Success(Some(Status.Failure(new BrandoException(error))), rest)
-    case _ ⇒ Failure(buffer)
+    case Some((error, leftBytes)) ⇒
+      Success(Some(Status.Failure(new BrandoException(error))), leftBytes)
+    case _ ⇒ Failure(buffer.size)
   }
 
   def readStatusReply(buffer: ListBuffer[Byte]) = splitLine(buffer) match {
-    case Some((status, rest)) ⇒
-      Success(StatusReply.fromString(status), rest)
-    case _ ⇒ Failure(buffer)
+    case Some((status, leftBytes)) ⇒
+      Success(StatusReply.fromString(status), leftBytes)
+    case _ ⇒ Failure(buffer.size)
   }
 
   def readIntegerReply(buffer: ListBuffer[Byte]) = splitLine(buffer) match {
-    case Some((int, rest)) ⇒ Success(Some(int.toLong), rest)
-    case x                 ⇒ Failure(buffer)
+    case Some((int, leftBytes)) ⇒ Success(Some(int.toLong), leftBytes)
+    case x                      ⇒ Failure(buffer.size)
   }
 
   def readBulkReply(buffer: ListBuffer[Byte]): Result = splitLine(buffer) match {
-    case Some((length, rest)) ⇒
+    case Some((length, leftBytes)) ⇒
       val dataLength = length.toInt
+      if (dataLength == -1) Success(None, leftBytes) //null response
+      else if (leftBytes >= dataLength + 2) { //leftBytes = data + "\r\n"
+        val header = buffer.size - leftBytes
+        val data = buffer.slice(header, header + dataLength)
+        Success(Some(data), leftBytes - (data.size + 2))
+      } else Failure(buffer.size)
 
-      if (dataLength == -1) Success(None, rest) //null response
-      else if (rest.length >= dataLength + 2) { //rest = data + "\r\n"
-        val data = rest.take(dataLength)
-        val remainder = rest.drop(dataLength + 2)
-        Success(Some(data), remainder)
-      } else Failure(buffer)
-
-    case _ ⇒ Failure(buffer)
+    case _ ⇒ Failure(buffer.size)
   }
 
   def readMultiBulkReply(buffer: ListBuffer[Byte]): Result = splitLine(buffer) match {
 
-    case Some((count, rest)) ⇒
+    case Some((count, leftBytes)) ⇒
       val itemCount = count.toInt
 
-      @tailrec def readComponents(remaining: Int, result: Result): Result = remaining match {
-        case 0                        ⇒ result
-        case _ if result.next.isEmpty ⇒ Failure(buffer)
+      @tailrec def readComponents(
+        remaining: Int,
+        result: Result,
+        start: Int): Result = remaining match {
+        case 0                           ⇒ result
+        case _ if (buffer.size == start) ⇒ Failure(buffer.size)
         case i ⇒
-          parse(result.next) match {
-            case failure: Failure ⇒ Failure(buffer)
-
-            case Success(newReply, next) ⇒
-              val replyList =
-                result.reply.map(_.asInstanceOf[ListBuffer[Option[Any]]])
+          parse(buffer.slice(start, buffer.size)) match {
+            case failure: Failure ⇒ Failure(buffer.size)
+            case Success(newReply, left) ⇒
+              val replyList = result.reply.map(_.asInstanceOf[ListBuffer[Option[Any]]])
               val newReplyList = replyList map (_ :+ newReply)
-
-              readComponents(i - 1, Success(newReplyList, next))
+              readComponents(i - 1, Success(newReplyList, left), buffer.size - left)
           }
       }
 
-      readComponents(itemCount, Success(Some(ListBuffer.empty[Option[Any]]), rest))
+      readComponents(itemCount, Success(Some(ListBuffer.empty[Option[Any]])), buffer.size - leftBytes)
 
-    case _ ⇒ Failure(buffer)
+    case _ ⇒ Failure(buffer.size)
   }
 
   def readPubSubMessage(buffer: ListBuffer[Byte]) = splitLine(buffer) match {
-    case Some((int, rest)) ⇒ Success(Some(int.toLong), rest)
-    case x                 ⇒ Failure(buffer)
+    case Some((int, leftBytes)) ⇒ Success(Some(int.toLong), leftBytes)
+    case x                      ⇒ Failure(buffer.size)
   }
 
   def parse(bytes: ByteString): Result = {
@@ -143,19 +139,17 @@ private[brando] trait ReplyParser {
   }
 
   @tailrec final def parseReply(bytes: ListBuffer[Byte])(withReply: Any ⇒ Unit) {
-    if (bytes.size > 0) {
-      parse(remainingBuffer ++ bytes) match {
-        case Failure(leftoverBytes) ⇒
-          remainingBuffer = leftoverBytes
-
-        case Success(reply, leftoverBytes) ⇒
-          remainingBuffer = ListBuffer[Byte]()
+    if (bytes.size > 0) remainingBuffer.appendAll(bytes)
+    if (remainingBuffer.size > 0) {
+      parse(remainingBuffer) match {
+        case Failure(leftBytes) ⇒
+        case Success(reply, leftBytes) ⇒
+          remainingBuffer = remainingBuffer.drop(remainingBuffer.size - leftBytes)
           withReply(reply)
-
-          if (leftoverBytes.size > 0) {
-            parseReply(leftoverBytes)(withReply)
-          }
+          parseReply(ListBuffer[Byte]())(withReply)
       }
-    } else Failure(bytes)
+    } else {
+      Failure(bytes.size)
+    }
   }
 }
