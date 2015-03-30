@@ -1,231 +1,153 @@
 package brando
 
-import akka.actor.{ Actor, ActorContext, ActorRef, Props, Status, Stash, Terminated, PoisonPill }
-import akka.actor.ActorDSL._
-import akka.io.{ IO, Tcp }
+import akka.actor._
 import akka.pattern._
-import akka.util.{ ByteString, Timeout }
-import scala.collection.mutable
+import akka.util._
 import scala.concurrent.duration._
 import scala.concurrent.Future
 import scala.util.Try
 
 import com.typesafe.config.ConfigFactory
-import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
 
-class BrandoException(message: String) extends Exception(message) {
-  override lazy val toString = "%s: %s\n".format(getClass.getName, message)
-}
-case class PubSubMessage(channel: String, message: String)
-private case class Connect(address: InetSocketAddress)
-private case class CommandAck(sender: ActorRef) extends Tcp.Event
-
-trait BrandoStateChange
-case object Disconnected extends BrandoStateChange
-case object Connected extends BrandoStateChange
-case object AuthenticationFailed extends BrandoStateChange
-case object ConnectionFailed extends BrandoStateChange
-
-private class Connection(
-    brando: ActorRef,
-    address: InetSocketAddress,
-    connectionRetry: Long,
-    maxConnectionAttempts: Option[Int],
-    connectionTimeout: FiniteDuration) extends Actor with ReplyParser {
-  import context.dispatcher
-
-  var socket: ActorRef = _
-
-  val requesterQueue = mutable.Queue.empty[ActorRef]
-  var subscribers: Map[ByteString, Seq[ActorRef]] = Map.empty
-
-  var connectionAttempts = 0
-
-  self ! Connect(address)
-
-  def getSubscribers(channel: ByteString): Seq[ActorRef] =
-    subscribers.get(channel).getOrElse(Seq.empty[ActorRef])
-
-  def receive = {
-    case subRequest: Request if (subRequest.command.utf8String.toLowerCase == "subscribe") ⇒
-
-      subRequest.params map { x ⇒
-        subscribers = subscribers + ((x, getSubscribers(x).+:(sender)))
-      }
-      socket ! Tcp.Write(subRequest.toByteString, CommandAck(sender))
-
-    case request: Request ⇒
-      socket ! Tcp.Write(request.toByteString, CommandAck(sender))
-
-    case CommandAck(sender) ⇒ requesterQueue.enqueue(sender)
-
-    case Tcp.Received(data) ⇒
-      parseReply(data) { reply ⇒
-        reply match {
-          case Some(List(Some(x: ByteString), Some(channel: ByteString), Some(message: ByteString))) if (x.utf8String == "message") ⇒
-
-            val pubSubMessage = PubSubMessage(channel.utf8String, message.utf8String)
-            getSubscribers(channel).map { x ⇒
-              x ! pubSubMessage
-            }
-
-          case _ ⇒
-            requesterQueue.dequeue ! (reply match {
-              case Some(failure: Status.Failure) ⇒
-                failure
-              case success ⇒
-                success
-            })
-        }
-      }
-
-    case Tcp.CommandFailed(writeMessage: Tcp.Write) ⇒
-      socket ! writeMessage //just retry immediately
-
-    case Tcp.CommandFailed(_: Tcp.Connect) ⇒
-      if (maxConnectionAttempts.isDefined && connectionAttempts >= maxConnectionAttempts.get) {
-        brando ! ConnectionFailed
-      } else {
-        connectionAttempts += 1
-        context.system.scheduler.scheduleOnce(connectionRetry.milliseconds, self, Connect(address))
-      }
-
-    case x: Tcp.ConnectionClosed ⇒
-      requesterQueue.clear
-      brando ! x
-      context.system.scheduler.scheduleOnce(connectionRetry.milliseconds, self, Connect(address))
-
-    case Connect(address) ⇒
-      IO(Tcp)(context.system) ! Tcp.Connect(address, timeout = Some(connectionTimeout))
-
-    case x: Tcp.Connected ⇒
-      socket = sender
-      connectionAttempts = 0
-      socket ! Tcp.Register(self, useResumeWriting = false)
-      brando ! x
-
-    case _ ⇒
-  }
-}
-
 object Brando {
+  def apply(): Props = apply("localhost", 6379)
   def apply(
     host: String,
     port: Int,
-    database: Option[Int] = None,
+    database: Int = 0,
     auth: Option[String] = None,
-    listeners: Set[ActorRef] = Set()): Props = Props(classOf[Brando], host, port, database, auth, listeners)
-  def apply(): Props = apply("localhost", 6379, None, None, Set())
+    listeners: Set[ActorRef] = Set(),
+    connectionTimeout: Option[FiniteDuration] = None,
+    connectionRetryDelay: Option[FiniteDuration] = None,
+    connectionRetryAttempts: Option[Int] = None,
+    connectionHeartbeatDelay: Option[FiniteDuration] = None): Props = {
+
+    val config = ConfigFactory.load()
+    Props(classOf[Brando],
+      host,
+      port,
+      database,
+      auth,
+      listeners,
+      connectionTimeout.getOrElse(
+        config.getDuration("brando.connection.timeout", TimeUnit.MILLISECONDS).millis),
+      Some(connectionRetryDelay.getOrElse(
+        config.getDuration("brando.connection.retry.delay", TimeUnit.MILLISECONDS).millis)),
+      connectionRetryAttempts,
+      connectionHeartbeatDelay)
+  }
+
+  private[brando] case class Connect(host: String, port: Int)
+  private[brando] case object Reconnect
+  case class AuthenticationFailed(host: String, port: Int) extends Connection.StateChange
 }
 
 class Brando(
     host: String,
-    port: Int,
-    database: Option[Int],
+    port: Integer,
+    database: Int,
     auth: Option[String],
-    private[brando] var listeners: Set[ActorRef]) extends Actor with Stash {
+    var listeners: Set[ActorRef],
+    connectionTimeout: FiniteDuration,
+    connectionRetryDelay: Option[FiniteDuration],
+    connectionRetryAttempts: Option[Int],
+    connectionHeartbeatDelay: Option[FiniteDuration]) extends Actor with Stash {
+
+  import Brando._
   import context.dispatcher
 
-  val config = context.system.settings.config
-  val connectionTimeout: Long = config.getDuration("redis.timeout", TimeUnit.MILLISECONDS)
-  val connectionRetry: Long = config.getDuration("brando.connection_retry", TimeUnit.MILLISECONDS)
-  val maxConnectionAttempts: Option[Int] = Try(config.getInt("brando.connection_attempts")).toOption
-  implicit val timeout = Timeout(connectionTimeout, TimeUnit.MILLISECONDS)
+  implicit val timeout = Timeout(connectionTimeout)
 
-  case object Authenticating
-  case object Authenticated
+  var connection = context.system.deadLetters
+  var retries = 0
 
-  val address = new InetSocketAddress(host, port)
-  val connection = context.actorOf(Props(classOf[Connection],
-    self, address, connectionRetry, maxConnectionAttempts, connectionTimeout.millis))
+  override def preStart: Unit = {
+    listeners.map(context.watch(_))
+    self ! Connect(host, port)
+  }
 
-  listeners.map(context.watch(_))
+  def receive = disconnected
 
-  def receive = disconnected orElse cleanListeners
-
-  def authenticated: Receive = {
+  def connected: Receive = common orElse {
     case request: Request ⇒
       connection forward request
 
     case batch: Batch ⇒
-      val requester = sender
-      val batcher = actor(new Act {
-        var responses = List[Any]()
-        become {
-          case response if (responses.size + 1) < batch.requests.size ⇒
-            responses = responses :+ response
-          case response ⇒
-            requester ! (responses :+ response)
-            self ! PoisonPill
-        }
-      })
-      batch.requests.foreach(connection.tell(_, batcher))
+      connection forward batch
 
-    case x: Tcp.ConnectionClosed ⇒
-      notifyStateChange(Disconnected)
-      context.become(disconnected orElse cleanListeners)
-    case s: ActorRef ⇒
-      listeners = listeners + s
+    case x: Connection.Disconnected ⇒
+      notifyStateChange(x)
+      context.become(disconnected)
+      self ! Reconnect
   }
 
-  def disconnected: Receive = {
-    case batch: Batch ⇒
-      stash()
-
+  def disconnected: Receive = common orElse {
     case request: Request ⇒
       stash()
 
-    case x: Tcp.Connected ⇒
-      context.become(authenticating orElse cleanListeners)
-
-      (for {
-        auth ← if (auth.isDefined) connection ? Request(ByteString("AUTH"), ByteString(auth.get)) else Future.successful(Unit)
-        database ← if (database.isDefined) connection ? Request(ByteString("SELECT"), ByteString(database.get.toString)) else Future.successful(Unit)
-      } yield (Connected)) map {
-        self ! _
-      } onFailure {
-        case e: Exception ⇒
-          self ! AuthenticationFailed
-      }
-
-    case ConnectionFailed ⇒
-      notifyStateChange(ConnectionFailed)
-
-    case s: ActorRef ⇒
-      listeners = listeners + s
-  }
-
-  def authenticating: Receive = {
     case batch: Batch ⇒
       stash()
 
-    case request: Request ⇒
-      stash()
+    case Connect(h, p) ⇒
+      connection ! PoisonPill
+      connection = context.actorOf(Props(classOf[Connection],
+        self, h, p, connectionTimeout, connectionHeartbeatDelay))
 
-    case x: Tcp.ConnectionClosed ⇒
-      notifyStateChange(Disconnected)
-      context.become(disconnected orElse cleanListeners)
+    case Reconnect ⇒
+      retries += 1
+      reconnect
 
-    case Connected ⇒
+    case x: Connection.Connecting ⇒
+      notifyStateChange(x)
+
+    case x: Connection.Connected ⇒
+      authenticate(x)
+
+    case ("auth_ok", x: Connection.Connected) ⇒
+      retries = 0
+      notifyStateChange(x)
+      context.become(connected)
       unstashAll()
-      notifyStateChange(Connected)
-      context.become(authenticated orElse cleanListeners)
 
-    case AuthenticationFailed ⇒
-      notifyStateChange(AuthenticationFailed)
-
-    case s: ActorRef ⇒
-      listeners = listeners + s
+    case x: Connection.ConnectionFailed ⇒
+      notifyStateChange(x)
+      self ! Reconnect
   }
 
-  def cleanListeners: Receive = {
+  def common: Receive = {
+    case s: ActorRef ⇒
+      listeners = listeners + s
+
     case Terminated(l) ⇒
       listeners = listeners - l
   }
 
-  private def notifyStateChange(newState: BrandoStateChange) {
+  def reconnect {
+    (connectionRetryDelay, connectionRetryAttempts) match {
+      case (Some(delay), Some(maxAttempts)) if (maxAttempts >= retries) ⇒
+        context.system.scheduler.scheduleOnce(delay, connection, Connection.Connect)
+      case (Some(delay), None) ⇒
+        context.system.scheduler.scheduleOnce(delay, connection, Connection.Connect)
+      case _ ⇒
+    }
+  }
+
+  def notifyStateChange(newState: Connection.StateChange) {
     listeners foreach { _ ! newState }
   }
 
+  def authenticate(x: Connection.Connected) {
+    (for {
+      auth ← if (auth.isDefined)
+        connection ? Request(ByteString("AUTH"), ByteString(auth.get)) else Future.successful(Unit)
+      database ← if (database != 0)
+        connection ? Request(ByteString("SELECT"), ByteString(database.toString)) else Future.successful(Unit)
+    } yield ("auth_ok", x)) map {
+      self ! _
+    } onFailure {
+      case e: Exception ⇒
+        notifyStateChange(Brando.AuthenticationFailed(x.host, x.port))
+    }
+  }
 }
