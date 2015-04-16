@@ -11,22 +11,8 @@ import com.typesafe.config.ConfigFactory
 import java.util.concurrent.TimeUnit
 
 object SentinelClient {
-  def apply(): Props = apply(Seq(Sentinel("localhost", 26379)))
-  def apply(
-    instances: Seq[Sentinel],
-    listeners: Set[ActorRef] = Set(),
-    connectionTimeout: Option[FiniteDuration] = None,
-    connectionHeartbeatDelay: Option[FiniteDuration] = None): Props = {
-
-    val config = ConfigFactory.load()
-    Props(classOf[SentinelClient], instances, listeners,
-      connectionTimeout.getOrElse(
-        config.getDuration("brando.connection.timeout", TimeUnit.MILLISECONDS).millis),
-      connectionHeartbeatDelay)
-  }
-
   case class Sentinel(host: String, port: Int)
-  private[brando] case class Connect(instances: Seq[Sentinel])
+  private[brando] case class Connect(sentinels: Seq[Sentinel])
   case class ConnectionFailed(sentinels: Seq[Sentinel]) extends Connection.StateChange
 }
 

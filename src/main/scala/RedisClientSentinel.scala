@@ -10,46 +10,22 @@ import scala.concurrent.duration._
 import com.typesafe.config.ConfigFactory
 import java.util.concurrent.TimeUnit
 
-object BrandoSentinel {
-  def apply(
-    name: String,
-    sentinel: ActorRef,
-    database: Int = 0,
-    auth: Option[String] = None,
-    listeners: Set[ActorRef] = Set(),
-    connectionTimeout: Option[FiniteDuration] = None,
-    connectionRetryDelay: Option[FiniteDuration] = None,
-    connectionHeartbeatDelay: Option[FiniteDuration] = None): Props = {
-
-    val config = ConfigFactory.load()
-    Props(classOf[BrandoSentinel],
-      name,
-      sentinel,
-      database,
-      auth,
-      listeners,
-      connectionTimeout.getOrElse(
-        config.getDuration("brando.connection.timeout", TimeUnit.MILLISECONDS).millis),
-      connectionRetryDelay.getOrElse(
-        config.getDuration("brando.connection.retry.delay", TimeUnit.MILLISECONDS).millis),
-      connectionHeartbeatDelay)
-  }
-
+object RedisClientSentinel {
   private[brando] case object SentinelConnect
 }
 
-class BrandoSentinel(
-  name: String,
-  sentinel: ActorRef,
+class RedisClientSentinel(
+  master: String,
+  sentinelClient: ActorRef,
   database: Int,
   auth: Option[String],
   listeners: Set[ActorRef],
   connectionTimeout: FiniteDuration,
   connectionRetryDelay: FiniteDuration,
-  connectionHeartbeatDelay: Option[FiniteDuration]) extends ConnectionSupervisor(database, auth,
+  connectionHeartbeatDelay: Option[FiniteDuration]) extends RedisConnectionSupervisor(database, auth,
   listeners, connectionTimeout, connectionHeartbeatDelay) {
 
-  import BrandoSentinel._
+  import RedisClientSentinel._
   import ConnectionSupervisor.{ Connect, Reconnect }
   import context.dispatcher
 
@@ -66,7 +42,7 @@ class BrandoSentinel(
       context.system.scheduler.scheduleOnce(connectionRetryDelay, self, SentinelConnect)
 
     case SentinelConnect ⇒
-      (sentinel ? Request("SENTINEL", "MASTER", name)) map {
+      (sentinelClient ? Request("SENTINEL", "MASTER", master)) map {
         case Response.AsStrings(res) ⇒
           val (ip, port) = extractIpPort(res)
           self ! Connect(ip, port)

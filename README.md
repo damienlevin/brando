@@ -125,7 +125,7 @@ All these messages inherit from the `Connection.StateChange` trait.
 
 #### SentinelClient
 
-Brando provides support for `monitoring`, `notification` and `automatic failover` using [sentinel](http://redis.io/topics/sentinel). It is implemented based on the following [guidelines](http://redis.io/topics/sentinel-clients)
+Brando provides support for `monitoring`, `notification` and `automatic failover` using [sentinel](http://redis.io/topics/sentinel). It is implemented based on the following [guidelines](http://redis.io/topics/sentinel-clients) and requires redis 2.8.12 or later.
 
 A sentinel client can be created like this. Here, we are using two instances and we provide a listener to receive  `Connection.StateChange` events.
 
@@ -153,6 +153,13 @@ Brando can be used with Sentinel to provide automatic failover and discovery. To
         val redis = system.actorOf(BrandoSentinel("mymaster", sentinel))
 
 	    redis ! Request("PING")
+
+Alternatively you can create a Brando sentinel like this:
+
+	    val redis = Brando.withSentinel(
+          master = "mymaster",
+          sentinels = Seq(Sentinel("localhost", 26379)))(system)
+
 
 For reliability we encourage to pass `connectionHeartbeatDelay` when using BrandoSentinel, this will generate a heartbeat to Redis and will improve failures detections in the case of network partitions.
 
@@ -203,6 +210,12 @@ It's possible to use sharding with Sentinel, to do so you need to use `SentinelS
         val sentinel = system.actorOf(SentinelClient())
 
         val shardManager = context.actorOf(ShardManager(shards,sentinel))
+
+Alternatively you can create a ShardManager with sentinel like this:
+
+        val shardManager = ShardManager.withSentinel(
+          shards = Seq(SentinelShard("mymaster", 0)),
+          sentinels = Seq(SentinelClient.Sentinel("localhost", 26379)))(system)
 
 
 ## Run the tests

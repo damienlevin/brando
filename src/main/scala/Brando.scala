@@ -1,84 +1,116 @@
 package brando
 
-import akka.actor._
+import akka.actor.{ Props ⇒ AkkaProps, _ }
 
 import scala.concurrent.duration._
-
 import com.typesafe.config.ConfigFactory
 import java.util.concurrent.TimeUnit
+import ShardManager._
 
-object Brando {
-  def apply(): Props = apply("localhost", 6379)
-  def apply(
-    host: String,
-    port: Int,
-    database: Int = 0,
-    auth: Option[String] = None,
-    listeners: Set[ActorRef] = Set(),
-    connectionTimeout: Option[FiniteDuration] = None,
-    connectionRetryDelay: Option[FiniteDuration] = None,
-    connectionRetryAttempts: Option[Int] = None,
-    connectionHeartbeatDelay: Option[FiniteDuration] = None): Props = {
+object Props {
+  object Sentinel {
 
     val config = ConfigFactory.load()
-    Props(classOf[Brando],
-      host,
-      port,
-      database,
-      auth,
-      listeners,
-      connectionTimeout.getOrElse(
-        config.getDuration("brando.connection.timeout", TimeUnit.MILLISECONDS).millis),
-      Some(connectionRetryDelay.getOrElse(
-        config.getDuration("brando.connection.retry.delay", TimeUnit.MILLISECONDS).millis)),
-      connectionRetryAttempts,
-      connectionHeartbeatDelay)
+
+    def apply(): AkkaProps = apply(Seq(SentinelClient.Sentinel("localhost", 26379)))
+    def apply(
+      sentinels: Seq[SentinelClient.Sentinel],
+      listeners: Set[ActorRef] = Set(),
+      connectionTimeout: Option[FiniteDuration] = None,
+      connectionHeartbeatDelay: Option[FiniteDuration] = None): AkkaProps = {
+
+      AkkaProps(classOf[SentinelClient], sentinels, listeners,
+        connectionTimeout.getOrElse(
+          config.getDuration("brando.connection.timeout", TimeUnit.MILLISECONDS).millis),
+        connectionHeartbeatDelay)
+
+    }
   }
 
-  case class AuthenticationFailed(host: String, port: Int) extends Connection.StateChange
-}
+  object Redis {
 
-class Brando(
-  host: String,
-  port: Int,
-  database: Int,
-  auth: Option[String],
-  listeners: Set[ActorRef],
-  connectionTimeout: FiniteDuration,
-  connectionRetryDelay: Option[FiniteDuration],
-  connectionRetryAttempts: Option[Int],
-  connectionHeartbeatDelay: Option[FiniteDuration]) extends ConnectionSupervisor(
-  database, auth, listeners, connectionTimeout, connectionHeartbeatDelay) {
+    val config = ConfigFactory.load()
 
-  import ConnectionSupervisor.{ Connect, Reconnect }
-  import context.dispatcher
+    def apply(): AkkaProps = apply("localhost", 6379)
+    def apply(
+      host: String,
+      port: Int,
+      database: Int = 0,
+      auth: Option[String] = None,
+      listeners: Set[ActorRef] = Set(),
+      connectionTimeout: Option[FiniteDuration] = None,
+      connectionRetryDelay: Option[FiniteDuration] = None,
+      connectionRetryAttempts: Option[Int] = None,
+      connectionHeartbeatDelay: Option[FiniteDuration] = None): AkkaProps = {
 
-  var retries = 0
+      AkkaProps(classOf[RedisClient],
+        host,
+        port,
+        database,
+        auth,
+        listeners,
+        connectionTimeout.getOrElse(
+          config.getDuration("brando.connection.timeout", TimeUnit.MILLISECONDS).millis),
+        Some(connectionRetryDelay.getOrElse(
+          config.getDuration("brando.connection.retry.delay", TimeUnit.MILLISECONDS).millis)),
+        connectionRetryAttempts,
+        connectionHeartbeatDelay)
+    }
 
-  override def preStart: Unit = {
-    listeners.map(context.watch(_))
-    self ! Connect(host, port)
-  }
+    def withSentinel(
+      master: String,
+      sentinelClient: ActorRef,
+      database: Int = 0,
+      auth: Option[String] = None,
+      listeners: Set[ActorRef] = Set(),
+      connectionTimeout: Option[FiniteDuration] = None,
+      connectionRetryDelay: Option[FiniteDuration] = None,
+      connectionHeartbeatDelay: Option[FiniteDuration] = None): AkkaProps = {
 
-  override def disconnected: Receive =
-    disconnectedWithRetry orElse super.disconnected
+      AkkaProps(classOf[RedisClientSentinel],
+        master,
+        sentinelClient,
+        database,
+        auth,
+        listeners,
+        connectionTimeout.getOrElse(
+          config.getDuration("brando.connection.timeout", TimeUnit.MILLISECONDS).millis),
+        connectionRetryDelay.getOrElse(
+          config.getDuration("brando.connection.retry.delay", TimeUnit.MILLISECONDS).millis),
+        connectionHeartbeatDelay)
+    }
 
-  def disconnectedWithRetry: Receive = {
-    case ("auth_ok", x: Connection.Connected) ⇒
-      retries = 0
-      notifyStateChange(x)
-      context.become(connected)
-      unstashAll()
+    def withShards(
+      shards: Seq[Shard],
+      listeners: Set[ActorRef] = Set(),
+      hashFunction: (Array[Byte] ⇒ Long) = ShardManager.defaultHashFunction,
+      connectionTimeout: Option[FiniteDuration] = None,
+      connectionRetryDelay: Option[FiniteDuration] = None,
+      connectionHeartbeatDelay: Option[FiniteDuration] = None): AkkaProps = {
 
-    case Reconnect ⇒
-      (connectionRetryDelay, connectionRetryAttempts) match {
-        case (Some(delay), Some(maxAttempts)) if (maxAttempts > retries) ⇒
-          retries += 1
-          context.system.scheduler.scheduleOnce(delay, connection, Connection.Connect)
-        case (Some(delay), None) ⇒
-          retries += 1
-          context.system.scheduler.scheduleOnce(delay, connection, Connection.Connect)
-        case _ ⇒
-      }
+      AkkaProps(classOf[ShardManager], shards, hashFunction, listeners, None,
+        connectionTimeout.getOrElse(
+          config.getDuration("brando.connection.timeout", TimeUnit.MILLISECONDS).millis),
+        connectionRetryDelay.getOrElse(
+          config.getDuration("brando.connection.retry.delay", TimeUnit.MILLISECONDS).millis),
+        connectionHeartbeatDelay)
+    }
+
+    def withShardsAndSentinel(
+      shards: Seq[Shard],
+      listeners: Set[ActorRef] = Set(),
+      sentinelClient: ActorRef,
+      hashFunction: (Array[Byte] ⇒ Long) = ShardManager.defaultHashFunction,
+      connectionTimeout: Option[FiniteDuration] = None,
+      connectionRetryDelay: Option[FiniteDuration] = None,
+      connectionHeartbeatDelay: Option[FiniteDuration] = None): AkkaProps = {
+
+      AkkaProps(classOf[ShardManager], shards, hashFunction, listeners, Some(sentinelClient),
+        connectionTimeout.getOrElse(
+          config.getDuration("brando.connection.timeout", TimeUnit.MILLISECONDS).millis),
+        connectionRetryDelay.getOrElse(
+          config.getDuration("brando.connection.retry.delay", TimeUnit.MILLISECONDS).millis),
+        connectionHeartbeatDelay)
+    }
   }
 }
